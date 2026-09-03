@@ -22,11 +22,12 @@ destructive or hard to reverse (locking down SSH, the first deploy).
 **The skill does NOT create cloud servers.** You never log into the cloud
 provider, never use provider CLIs/APIs (no `hcloud`), and never create, select,
 modify, or delete servers or projects. The user creates the server themselves
-(you give them instructions in Phase 1). The skill begins once the user provides
+(you give them instructions in Phase 2). The skill begins once the user provides
 a **public IP address** and you can confirm **SSH-as-root works** with their key.
 
-The two provisioning scripts live next to this file in `scripts/`:
-`provision.sh` (server setup + deploy user) and `harden-ssh.sh` (SSH lockdown).
+The provisioning scripts live next to this file in `scripts/`: `provision.sh`
+(server setup + deploy user), `harden-ssh.sh` (SSH lockdown), and
+`check-hardening.sh` (a read-only audit that verifies both took effect).
 Reference them by their absolute path inside the skill directory.
 
 ## Track progress with your task list
@@ -37,13 +38,15 @@ and `completed` when it's verified (`TaskUpdate`). This gives the user a live
 view of where they are. Suggested tasks:
 
 1. Pre-flight checks
-2. User creates the VPS (collect IP, confirm SSH)
-3. Provision & harden the server (incl. automatic-reboot window)
-4. Configure Kamal
-5. Point DNS at the server (Cloudflare optional)
-6. First deploy & verify
-7. Set up backups (Litestream + Hetzner snapshots)
-8. Wrap up
+2. Inspect the server and confirm the checklist (multi-select)
+3. User creates the VPS (collect IP, confirm SSH)
+4. Provision & harden the server (incl. fail2ban whitelist, automatic-reboot
+   window), then verify with `check-hardening.sh`
+5. Configure Kamal
+6. Point DNS at the server (Cloudflare optional)
+7. First deploy & verify
+8. Set up backups (Litestream + Hetzner snapshots)
+9. Wrap up
 
 ## Guardrails
 
@@ -81,13 +84,77 @@ Then summarise the current state and the plan, and ask the user for the things
 you'll need throughout:
 
 - **Domain** they'll deploy to (e.g. `rubygrids.app`).
-- **Container registry** to use — see Phase 3. Recommend GitHub Container
+- **Container registry** to use — see Phase 4. Recommend GitHub Container
   Registry (`ghcr.io`) or Docker Hub.
 - **Deploy username** (default `deploy`).
 - Whether they want to use **Cloudflare** for DNS, or another provider/registrar
   (Phase 5). Either is fine.
 
-## Phase 1 — The user creates the server (you only instruct)
+## Phase 1 — Inspect the server and confirm the checklist
+
+**Never start work on the server before the user has seen the concrete list of
+what you would do and picked from it.** This phase always runs. It is
+especially important because the skill is often pointed at a server that is
+**already provisioned and serving traffic** — reusing a box for a second app —
+not only at a fresh VPS.
+
+If the user has no server yet, do Phase 2 first and come back here as soon as
+SSH works.
+
+### Step 1a — Inspect the current state
+
+The checklist must reflect reality, so look before you propose. Run one block
+(as `root` on a fresh box, as `<DEPLOY_USER>` on an existing one) and read the
+output:
+
+```bash
+ssh <USER>@<SERVER_IP> '
+  echo "== docker ==";      docker --version 2>/dev/null || echo "not installed"
+  echo "== containers ==";  docker ps --format "{{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null
+  echo "== ufw ==";         sudo ufw status verbose 2>/dev/null | head -20
+  echo "== fail2ban ==";    systemctl is-active fail2ban; sudo fail2ban-client status sshd 2>/dev/null
+  echo "== upgrades ==";    systemctl is-active unattended-upgrades; cat /etc/apt/apt.conf.d/51auto-reboot 2>/dev/null
+  echo "== swap ==";        swapon --show || echo "none"
+  echo "== users ==";       awk -F: "\$3>=1000 && \$3<65534 {print \$1}" /etc/passwd
+  echo "== sshd ==";        sudo sshd -T | grep -E "^(permitrootlogin|passwordauthentication)"
+  echo "== reboot ==";      test -f /var/run/reboot-required && echo required || echo none
+  echo "== timezone ==";    timedatectl | grep "Time zone"
+  echo "== disk ==";        df -h /
+'
+```
+
+Report what you found compactly — Docker version and running containers, UFW,
+fail2ban, unattended-upgrades, swap, existing non-root users, the *effective*
+SSH config, pending reboot, timezone, disk.
+
+### Step 1b — Present the checklist and confirm (multi-select)
+
+Show the proposed actions with their current state, as a table or bullet list:
+
+| Action | Current state | Proposal |
+| --- | --- | --- |
+| Docker + base tooling | installed 27.x | already done |
+| UFW firewall (22/80/443) | active | already done |
+| fail2ban | active, sshd jail | already done |
+| Whitelist your IP in fail2ban | not set | offer |
+| Swap file | none | offer 2G |
+| Deploy user `<DEPLOY_USER>` | missing | offer |
+| SSH hardening | root login still allowed | offer |
+| Automatic security reboots | not configured | offer |
+| Configure Kamal / DNS / deploy | — | offer |
+
+Then ask for confirmation with the `AskUserQuestion` tool using
+`multiSelect: true`, offering **only the items that still need doing**. Items
+already satisfied are shown as already-done in the table and are not re-offered,
+so the user only picks among real work.
+
+- The selection governs what runs. Anything not selected is **skipped**, not
+  quietly done anyway — and the wrap-up (Phase 8) must list what was skipped.
+- Destructive or hard-to-reverse items (SSH hardening, the first deploy) still
+  get their own explicit confirmation at the moment they run, even when
+  selected here.
+
+## Phase 2 — The user creates the server (you only instruct)
 
 You do **not** create the server. Give the user a clear checklist and wait for
 them to come back with the **public IPv4 address**. For Hetzner Cloud:
@@ -123,12 +190,12 @@ If this fails, the SSH key probably wasn't attached at create time, or they need
 to pass `-i <key>` — help them fix it before continuing. Do not proceed until
 this succeeds.
 
-## Phase 2 — Provision and harden the server
+## Phase 3 — Provision and harden the server
 
 This is the part the skill automates. Two steps, with a verification gate
 between them.
 
-### Step 2a — Provision (safe, idempotent)
+### Step 3a — Provision (safe, idempotent)
 
 Pipe `scripts/provision.sh` to the server as root. Pass the deploy username and
 optionally a swap size:
@@ -142,7 +209,7 @@ and UFW (22/80/443), creates a 2 GB swap file, and creates the non-root deploy
 user — copying the root account's authorized SSH key to it and granting
 passwordless sudo + docker group membership. Stream the output to the user.
 
-### Step 2b — Verify the deploy user (GATE)
+### Step 3b — Verify the deploy user (GATE)
 
 Before locking anything down, prove the new user can log in and use Docker:
 
@@ -150,10 +217,53 @@ Before locking anything down, prove the new user can log in and use Docker:
 ssh <DEPLOY_USER>@<SERVER_IP> 'whoami && docker ps'
 ```
 
-If this fails, **do not proceed to 2c** — debug (wrong key, group membership)
+If this fails, **do not proceed to 3d** — debug (wrong key, group membership)
 while root login still works.
 
-### Step 2c — Harden SSH (only after 2b passes)
+### Step 3c — Whitelist your current IP in fail2ban (always ask)
+
+`provision.sh` installs a fail2ban sshd jail with `maxretry = 5`. An SSH client
+that offers many keys (a 1Password agent holding ~20 keys, say) produces several
+failed auths *per connection attempt*, so a couple of ordinary logins can ban
+the administrator's own IP for the whole `bantime` (1h) — the app keeps serving,
+but SSH is refused.
+
+Detect the current public IP and confirm the server sees the same address (no
+NAT surprise):
+
+```bash
+curl -s https://api.ipify.org
+ssh <DEPLOY_USER>@<SERVER_IP> 'echo $SSH_CLIENT | awk "{print \$1}"'
+```
+
+**Ask the user** whether to whitelist it. The trade-off: a shared/corporate VPN
+exit IP exempts everyone behind it from fail2ban, while a residential IP may
+change over time and the exemption then protects nothing. It's a
+convenience/safety trade — declining is fine.
+
+If they accept:
+
+```bash
+ssh <DEPLOY_USER>@<SERVER_IP> "sudo tee /etc/fail2ban/jail.d/ignoreip.local >/dev/null <<'EOF'
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 <CURRENT_IP>
+EOF
+sudo fail2ban-client reload"
+```
+
+Verify with `sudo fail2ban-client get sshd ignoreip` and
+`sudo fail2ban-client status sshd`.
+
+To recover from an existing ban: `sudo fail2ban-client set sshd unbanip <IP>`.
+Note that if you are *already* banned you cannot SSH in to run it — wait out the
+`bantime` or use the provider's web console.
+
+Prevention, either way: pass `-o IdentitiesOnly=yes -i <key>` when testing SSH
+(`-i` alone does **not** stop the agent from enumerating every key), and set
+`keys_only: true` alongside `keys:` in the Kamal `ssh:` block in
+`config/deploy.yml` (Phase 4).
+
+### Step 3d — Harden SSH (only after 3b passes)
 
 Tell the user this disables password authentication and root login, then run:
 
@@ -165,7 +275,12 @@ From now on, connect as `<DEPLOY_USER>@<SERVER_IP>`. If a reboot was flagged as
 required, suggest `ssh <DEPLOY_USER>@<SERVER_IP> 'sudo reboot'` at a convenient
 time.
 
-### Step 2d — Automatic security reboots (ask the user)
+When checking that root login is really disabled: a `Too many authentication
+failures` error is **not** proof — it only means the client offered too many
+keys. Verify with `ssh -o IdentitiesOnly=yes -i <key> root@<SERVER_IP>` or
+`ssh <DEPLOY_USER>@<SERVER_IP> 'sudo sshd -T | grep permitrootlogin'`.
+
+### Step 3e — Automatic security reboots (ask the user)
 
 `unattended-upgrades` installs security updates but does **not** reboot when a
 kernel/library update needs it — the box just sits with `/var/run/reboot-required`
@@ -198,7 +313,26 @@ EOF"
 If the user declines, skip this — it's optional. Mention that a reboot will
 briefly interrupt the app (a few seconds), which is why the quiet window matters.
 
-## Phase 3 — Configure Kamal
+### Step 3f — Verify the hardening (automated audit)
+
+Don't eyeball whether the protections took effect — run the read-only auditor and
+read its exit code. It checks the effective SSH config (`sshd -T`), UFW
+(active, default-deny, 22/80/443), fail2ban + its `sshd` jail, unattended-upgrades,
+swap + swappiness, the deploy user (docker group, sudoers, authorized_keys),
+Docker, and flags any unexpected publicly-bound port:
+
+```bash
+ssh <DEPLOY_USER>@<SERVER_IP> 'sudo bash -s' -- <DEPLOY_USER> < <SKILL_DIR>/scripts/check-hardening.sh
+```
+
+It changes nothing and is re-runnable anytime. **Exit 0** means every required
+check passed; a non-zero exit means at least one `FAIL` — investigate and fix it
+before moving on (a `FAIL` here usually means a provisioning/hardening step didn't
+apply). `WARN` lines are advisory (e.g. auto-reboot not configured, a pending
+reboot, an extra open port) and don't fail the audit. Offer this same command to
+the user as a day-2 check.
+
+## Phase 4 — Configure Kamal
 
 Edit `config/deploy.yml` and `.kamal/secrets` in the app repo with targeted
 `Edit`s (don't rewrite the files). Set:
@@ -212,7 +346,12 @@ Edit `config/deploy.yml` and `.kamal/secrets` in the app repo with targeted
   ```yaml
   ssh:
     user: <DEPLOY_USER>
+    keys: [ "~/.ssh/id_ed25519" ]
+    keys_only: true
   ```
+
+  `keys_only: true` stops Kamal's SSH from offering every key in the agent,
+  which is what trips the fail2ban jail (Step 3c).
 
 - `registry` → the chosen registry. For **GHCR**: `server: ghcr.io`,
   `username: <github-user>`, and `image: <github-user>/<app>` (lowercase). For
@@ -237,7 +376,7 @@ behind kamal-proxy.
 Then validate config without deploying: `bin/kamal config` and eyeball the
 resolved repository, host, and ssh user.
 
-## Phase 4 — Point DNS at the server (before deploying)
+## Phase 5 — Point DNS at the server (before deploying)
 
 Let's Encrypt validates over HTTP on port 80, so the domain must resolve to the
 server's IP *before* the first deploy — **regardless of which DNS provider** the
@@ -259,13 +398,13 @@ accordingly:
 Confirm before deploying: `dig +short <DOMAIN> A @1.1.1.1` returns the server IP.
 
 If the user opted out of Cloudflare, that's completely fine — skip it. If they
-chose Cloudflare: after a successful deploy with a valid origin cert (Phase 5),
+chose Cloudflare: after a successful deploy with a valid origin cert (Phase 6),
 they *may* switch the record to **Proxied (orange cloud)** and set **SSL/TLS →
 Overview → Full (strict)**. Explain the trade-off: proxied adds Cloudflare's
 CDN/WAF but Cloudflare then terminates TLS; "Full (strict)" keeps it encrypted to
 the origin's Let's Encrypt cert. Leaving it DNS-only is perfectly fine too.
 
-## Phase 5 — First deploy
+## Phase 6 — First deploy
 
 1. Make sure the local Docker daemon is running (Kamal builds the image
    locally): `docker info` succeeds. If the user's Mac is arm64 and the builder
@@ -288,7 +427,7 @@ the origin's Let's Encrypt cert. Leaving it DNS-only is perfectly fine too.
 
 For subsequent releases the command is just `bin/kamal deploy`. Mention this.
 
-## Phase 6 — Set up backups
+## Phase 7 — Set up backups
 
 Getting "live" is not the same as "durable". A single-server SQLite app keeps its
 database (and Solid Queue/Cache/Cable) on **one Docker volume on one VM** — if the
@@ -300,7 +439,7 @@ recommend doing **both**:
 - **Hetzner backups** — daily whole-VM snapshots. Recovers the entire machine
   (OS, config, volumes) if the server itself is lost.
 
-### 6a — Litestream (via the `litestream` gem)
+### 7a — Litestream (via the `litestream` gem)
 
 This app already runs Solid Queue inside Puma, so run Litestream the same way —
 the gem ships a **Puma plugin**, no extra Kamal role or container needed.
@@ -375,20 +514,23 @@ the gem ships a **Puma plugin**, no extra Kamal role or container needed.
    -- --database=storage/production.sqlite3` after stopping the app — but don't run
    it now; it's destructive to the current DB.
 
-### 6b — Hetzner backups (whole-VM snapshots)
+### 7b — Hetzner backups (whole-VM snapshots)
 
 The user enables these in the console (you don't touch the provider): **Server →
 Backups → Enable Backups**. It's ~20% of the server price, runs daily, and keeps
 7 rolling snapshots. Explain this complements Litestream: Litestream gives
 near-zero-loss DB recovery; Hetzner backups rebuild the whole box.
 
-## Phase 7 — Wrap up
+## Phase 8 — Wrap up
 
 Give the user a short summary:
 
 - Server IP, deploy user, and the one-liner to SSH in.
-- What hardening was applied (firewall ports, fail2ban, auto-updates, auto-reboot
-  window if set, no root / no password SSH).
+- What hardening was applied (firewall ports, fail2ban and whether the user's IP
+  is whitelisted, auto-updates, auto-reboot window if set, no root / no password
+  SSH).
+- **What was skipped** — every item the user didn't select in the Phase 1
+  multi-select, and how to come back to it later.
 - Registry in use and where the token lives.
 - DNS provider used and whether Cloudflare is in front.
 - Backups: Litestream replica target + that Hetzner backups are on.
@@ -402,6 +544,9 @@ Give the user a short summary:
   bin/kamal app exec -i "bin/rails console"   # production console
   bin/kamal app details       # container status
   ssh <DEPLOY_USER>@<SERVER_IP>               # get on the box
+
+  # re-audit the server's hardening anytime (read-only, exit 0 = all good):
+  ssh <DEPLOY_USER>@<SERVER_IP> 'sudo bash -s' -- <DEPLOY_USER> < <SKILL_DIR>/scripts/check-hardening.sh
   ```
 
 - A reminder: this skill works for future apps too — run it from any Kamal app
@@ -414,7 +559,13 @@ should reference env vars / commands, never literal tokens) on a branch.
 
 - **Never create, modify, or delete cloud servers/projects, or use provider
   CLIs/APIs.** The user creates the server; you start from the IP they give you.
-- Don't disable root login (Phase 2c) before the deploy user is verified (2b).
+- Don't touch the server before the user has confirmed the Phase 1 checklist in
+  the multi-select — and don't re-offer or redo what the inspection showed is
+  already in place.
+- Don't skip the fail2ban whitelist question, and don't read a `Too many
+  authentication failures` error as proof that hardening worked — it usually
+  just means the client offered too many keys.
+- Don't disable root login (Phase 3d) before the deploy user is verified (3b).
 - Don't deploy before DNS resolves — the Let's Encrypt cert will fail.
 - Don't put the apex record on Cloudflare's proxy (orange cloud) during the
   first deploy.
